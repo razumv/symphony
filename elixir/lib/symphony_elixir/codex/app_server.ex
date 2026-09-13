@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @controller_credential_environment_names ["MY_SYMPHONY_ADMISSION_TOKEN_FILE"]
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -239,12 +240,17 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp tracker_secret_port_env(dynamic_tool_binding) do
     dynamic_tool_binding.secret_environment_names
+    |> Kernel.++(@controller_credential_environment_names)
     |> valid_environment_names()
+    |> Enum.uniq()
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
   defp tracker_secret_unset_command(dynamic_tool_binding) do
-    case dynamic_tool_binding.secret_environment_names |> valid_environment_names() do
+    case dynamic_tool_binding.secret_environment_names
+         |> Kernel.++(@controller_credential_environment_names)
+         |> valid_environment_names()
+         |> Enum.uniq() do
       [] -> nil
       names -> "unset " <> Enum.join(names, " ")
     end
