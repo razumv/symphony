@@ -158,8 +158,13 @@ Notes:
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
-  unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
-  Symphony validation.
+  unchanged unless a local `workspaceWrite.writableRoots` entry begins exactly with
+  `{{workspace}}/`. That placeholder resolves only to an existing, canonical directory strictly
+  inside the current local issue workspace (for example, `{{workspace}}/.git`); missing paths,
+  files, `..`/symlink escapes, and remote sessions fail closed. No environment or relative-path
+  interpolation is performed, and all non-placeholder fields (including `networkAccess`) remain
+  unchanged. Compatibility for every other explicit policy value depends on the targeted Codex
+  app-server version rather than local Symphony validation.
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
