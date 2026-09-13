@@ -11,6 +11,8 @@ defmodule SymphonyElixir.Config.Schema do
   @linear_endpoint "https://api.linear.app/graphql"
   @linear_active_states ["Todo", "In Progress"]
   @linear_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+  @workspace_placeholder "{{workspace}}"
+  @workspace_placeholder_prefix @workspace_placeholder <> "/"
 
   @type t :: %__MODULE__{}
 
@@ -336,7 +338,7 @@ defmodule SymphonyElixir.Config.Schema do
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
     case settings.codex.turn_sandbox_policy do
       %{} = policy ->
-        {:ok, policy}
+        resolve_explicit_runtime_turn_sandbox_policy(policy, workspace, opts)
 
       _ ->
         workspace
@@ -592,6 +594,146 @@ defmodule SymphonyElixir.Config.Schema do
   defp default_runtime_turn_sandbox_policy(workspace_root, _opts) do
     {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
   end
+
+  defp resolve_explicit_runtime_turn_sandbox_policy(policy, workspace, opts) do
+    case policy do
+      %{"type" => "workspaceWrite", "writableRoots" => writable_roots}
+      when is_list(writable_roots) ->
+        resolve_workspace_placeholder_roots(policy, writable_roots, workspace, opts)
+
+      _ ->
+        if contains_workspace_placeholder?(policy) do
+          {:error, {:unsafe_turn_sandbox_policy, :workspace_placeholder_outside_writable_roots}}
+        else
+          {:ok, policy}
+        end
+    end
+  end
+
+  defp resolve_workspace_placeholder_roots(policy, writable_roots, workspace, opts) do
+    cond do
+      contains_workspace_placeholder?(Map.delete(policy, "writableRoots")) ->
+        {:error, {:unsafe_turn_sandbox_policy, :workspace_placeholder_outside_writable_roots}}
+
+      Enum.any?(writable_roots, &contains_workspace_placeholder?/1) ->
+        if Keyword.get(opts, :remote, false) do
+          {:error, {:unsafe_turn_sandbox_policy, :workspace_placeholder_remote}}
+        else
+          resolve_local_workspace_placeholder_roots(policy, writable_roots, workspace)
+        end
+
+      true ->
+        {:ok, policy}
+    end
+  end
+
+  defp resolve_local_workspace_placeholder_roots(policy, writable_roots, workspace) do
+    with {:ok, canonical_workspace} <- canonical_existing_workspace(workspace),
+         {:ok, resolved_roots} <-
+           resolve_workspace_placeholder_roots(writable_roots, canonical_workspace) do
+      {:ok, Map.put(policy, "writableRoots", resolved_roots)}
+    end
+  end
+
+  defp canonical_existing_workspace(workspace) when is_binary(workspace) and workspace != "" do
+    expanded_workspace = Path.expand(workspace)
+
+    with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
+         true <- File.dir?(canonical_workspace) do
+      {:ok, canonical_workspace}
+    else
+      false -> {:error, {:unsafe_turn_sandbox_policy, {:workspace_not_directory, expanded_workspace}}}
+      {:error, _reason} -> {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace, expanded_workspace}}}
+    end
+  end
+
+  defp canonical_existing_workspace(workspace) do
+    {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace, workspace}}}
+  end
+
+  defp resolve_workspace_placeholder_roots(writable_roots, canonical_workspace) do
+    Enum.reduce_while(writable_roots, {:ok, []}, fn root, {:ok, roots} ->
+      case resolve_workspace_placeholder_root(root, canonical_workspace) do
+        {:ok, resolved_root} -> {:cont, {:ok, [resolved_root | roots]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, roots} -> {:ok, Enum.reverse(roots)}
+      error -> error
+    end
+  end
+
+  defp resolve_workspace_placeholder_root(root, canonical_workspace)
+       when is_binary(root) do
+    cond do
+      not String.contains?(root, @workspace_placeholder) ->
+        {:ok, root}
+
+      not String.starts_with?(root, @workspace_placeholder_prefix) ->
+        {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_placeholder, root}}}
+
+      true ->
+        workspace_placeholder_candidate(root, canonical_workspace)
+    end
+  end
+
+  defp resolve_workspace_placeholder_root(root, _canonical_workspace) do
+    {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_placeholder, root}}}
+  end
+
+  defp workspace_placeholder_candidate(root, canonical_workspace) do
+    relative_path = String.replace_prefix(root, @workspace_placeholder_prefix, "")
+
+    with :ok <- validate_workspace_placeholder_relative_path(relative_path, root),
+         {:ok, canonical_candidate} <- PathSafety.canonicalize(Path.join(canonical_workspace, relative_path)) do
+      cond do
+        not strict_descendant?(canonical_candidate, canonical_workspace) ->
+          symlink_escape =
+            {:workspace_placeholder_symlink_escape, root, canonical_candidate, canonical_workspace}
+
+          {:error, {:unsafe_turn_sandbox_policy, symlink_escape}}
+
+        not File.dir?(canonical_candidate) ->
+          {:error, {:unsafe_turn_sandbox_policy, {:workspace_placeholder_not_directory, root}}}
+
+        true ->
+          {:ok, canonical_candidate}
+      end
+    else
+      {:error, _reason} -> {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_placeholder, root}}}
+    end
+  end
+
+  defp validate_workspace_placeholder_relative_path(relative_path, root) do
+    if relative_path != "" and Path.type(relative_path) == :relative and
+         Enum.all?(Path.split(relative_path), &(&1 != "..")) do
+      :ok
+    else
+      {:error, {:invalid_workspace_placeholder, root}}
+    end
+  end
+
+  defp strict_descendant?(candidate, workspace) do
+    relative_path = Path.relative_to(candidate, workspace)
+
+    relative_path != candidate and relative_path != "." and relative_path != ".." and
+      not String.starts_with?(relative_path, "../")
+  end
+
+  defp contains_workspace_placeholder?(value) when is_binary(value),
+    do: String.contains?(value, @workspace_placeholder)
+
+  defp contains_workspace_placeholder?(value) when is_list(value),
+    do: Enum.any?(value, &contains_workspace_placeholder?/1)
+
+  defp contains_workspace_placeholder?(value) when is_map(value),
+    do:
+      Enum.any?(value, fn {key, nested_value} ->
+        contains_workspace_placeholder?(key) or contains_workspace_placeholder?(nested_value)
+      end)
+
+  defp contains_workspace_placeholder?(_value), do: false
 
   defp default_workspace_root(workspace, _fallback) when is_binary(workspace) and workspace != "",
     do: workspace

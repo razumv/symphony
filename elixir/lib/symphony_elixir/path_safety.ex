@@ -1,12 +1,14 @@
 defmodule SymphonyElixir.PathSafety do
   @moduledoc false
 
+  @max_symlink_resolutions 40
+
   @spec canonicalize(Path.t()) :: {:ok, Path.t()} | {:error, term()}
   def canonicalize(path) when is_binary(path) do
     expanded_path = Path.expand(path)
     {root, segments} = split_absolute_path(expanded_path)
 
-    case resolve_segments(root, [], segments) do
+    case resolve_segments(root, [], segments, MapSet.new(), 0) do
       {:ok, canonical_path} ->
         {:ok, canonical_path}
 
@@ -20,27 +22,80 @@ defmodule SymphonyElixir.PathSafety do
     {root, segments}
   end
 
-  defp resolve_segments(root, resolved_segments, []), do: {:ok, join_path(root, resolved_segments)}
+  defp resolve_segments(root, resolved_segments, [], _seen_symlink_states, _symlink_resolutions),
+    do: {:ok, join_path(root, resolved_segments)}
 
-  defp resolve_segments(root, resolved_segments, [segment | rest]) do
+  defp resolve_segments(root, resolved_segments, [segment | rest], seen_symlink_states, symlink_resolutions) do
     candidate_path = join_path(root, resolved_segments ++ [segment])
 
     case File.lstat(candidate_path) do
       {:ok, %File.Stat{type: :symlink}} ->
-        with {:ok, target} <- :file.read_link_all(String.to_charlist(candidate_path)) do
-          resolved_target = Path.expand(IO.chardata_to_string(target), join_path(root, resolved_segments))
-          {target_root, target_segments} = split_absolute_path(resolved_target)
-          resolve_segments(target_root, [], target_segments ++ rest)
-        end
+        resolve_symlink(
+          candidate_path,
+          root,
+          resolved_segments,
+          rest,
+          seen_symlink_states,
+          symlink_resolutions
+        )
 
       {:ok, _stat} ->
-        resolve_segments(root, resolved_segments ++ [segment], rest)
+        resolve_segments(root, resolved_segments ++ [segment], rest, seen_symlink_states, symlink_resolutions)
 
       {:error, :enoent} ->
         {:ok, join_path(root, resolved_segments ++ [segment | rest])}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp resolve_symlink(
+         candidate_path,
+         root,
+         resolved_segments,
+         rest,
+         seen_symlink_states,
+         symlink_resolutions
+       ) do
+    cond do
+      MapSet.member?(seen_symlink_states, {candidate_path, rest}) ->
+        {:error, :symlink_loop}
+
+      symlink_resolutions >= @max_symlink_resolutions ->
+        {:error, :symlink_depth_exceeded}
+
+      true ->
+        follow_symlink(
+          candidate_path,
+          root,
+          resolved_segments,
+          rest,
+          seen_symlink_states,
+          symlink_resolutions
+        )
+    end
+  end
+
+  defp follow_symlink(
+         candidate_path,
+         root,
+         resolved_segments,
+         rest,
+         seen_symlink_states,
+         symlink_resolutions
+       ) do
+    with {:ok, target} <- :file.read_link_all(String.to_charlist(candidate_path)) do
+      resolved_target = Path.expand(IO.chardata_to_string(target), join_path(root, resolved_segments))
+      {target_root, target_segments} = split_absolute_path(resolved_target)
+
+      resolve_segments(
+        target_root,
+        [],
+        target_segments ++ rest,
+        MapSet.put(seen_symlink_states, {candidate_path, rest}),
+        symlink_resolutions + 1
+      )
     end
   end
 

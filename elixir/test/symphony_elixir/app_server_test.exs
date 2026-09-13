@@ -272,6 +272,164 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server sends the current workspace git directory for a workspace placeholder" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-workspace-sandbox-root-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1002")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-workspace-sandbox-root.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+      File.mkdir_p!(Path.join(workspace, ".git"))
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex-workspace-sandbox-root.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1002"}}}' ;;
+          3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1002"}}}' ;;
+          4) printf '%s\\n' '{"method":"turn/completed"}'; exit 0 ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_turn_sandbox_policy: %{
+          type: "workspaceWrite",
+          writableRoots: ["{{workspace}}/.git"],
+          networkAccess: true
+        }
+      )
+
+      issue = %Issue{
+        id: "issue-workspace-sandbox-root",
+        identifier: "MT-1002",
+        title: "Resolve workspace git sandbox root",
+        description: "Verify the app-server receives the current workspace Git directory",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-1002",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Resolve sandbox root", issue)
+      assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+      assert {:ok, canonical_git_dir} = SymphonyElixir.PathSafety.canonicalize(Path.join(workspace, ".git"))
+
+      assert File.read!(trace_file)
+             |> String.split("\n", trim: true)
+             |> Enum.any?(fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload = line |> String.trim_leading("JSON:") |> Jason.decode!()
+
+                 payload["method"] == "turn/start" and
+                   get_in(payload, ["params", "cwd"]) == canonical_workspace and
+                   get_in(payload, ["params", "sandboxPolicy"]) == %{
+                     "type" => "workspaceWrite",
+                     "writableRoots" => [canonical_git_dir],
+                     "networkAccess" => true
+                   }
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server rejects invalid local and remote workspace placeholder policies before launching a port" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-placeholder-policy-before-port-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_PORT_TRACE")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_PORT_TRACE", previous_trace)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1003")
+      local_trace = Path.join(test_root, "local-port.trace")
+      remote_trace = Path.join(test_root, "remote-port.trace")
+      fake_codex = Path.join(test_root, "fake-codex")
+      fake_ssh = Path.join(test_root, "ssh")
+
+      File.mkdir_p!(workspace)
+      File.ln_s!(".git", Path.join(workspace, ".git"))
+      File.write!(fake_codex, "#!/bin/sh\nprintf 'local\\n' >> \"$SYMP_TEST_PORT_TRACE\"\n")
+      File.write!(fake_ssh, "#!/bin/sh\nprintf 'remote\\n' >> \"$SYMP_TEST_PORT_TRACE\"\n")
+      File.chmod!(fake_codex, 0o755)
+      File.chmod!(fake_ssh, 0o755)
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{fake_codex} app-server",
+        codex_turn_sandbox_policy: %{
+          type: "workspaceWrite",
+          writableRoots: ["{{workspace}}/.git"]
+        }
+      )
+
+      System.put_env("SYMP_TEST_PORT_TRACE", local_trace)
+
+      local_task = Task.async(fn -> AppServer.start_session(workspace) end)
+
+      case Task.yield(local_task, 500) do
+        {:ok, result} ->
+          assert {:error, {:unsafe_turn_sandbox_policy, _}} = result
+
+        nil ->
+          Task.shutdown(local_task, :brutal_kill)
+          flunk("local placeholder policy resolution did not terminate")
+      end
+
+      refute File.exists?(local_trace)
+
+      System.put_env("SYMP_TEST_PORT_TRACE", remote_trace)
+
+      assert {:error, {:unsafe_turn_sandbox_policy, _}} =
+               AppServer.start_session("/remote/workspaces/MT-1003", worker_host: "worker-01")
+
+      refute File.exists?(remote_trace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(

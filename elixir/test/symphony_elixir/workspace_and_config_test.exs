@@ -1530,6 +1530,163 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "runtime sandbox policy resolves a workspace git placeholder only for the current local workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-runtime-sandbox-workspace-token-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      first_workspace = Path.join(test_root, "first-workspace")
+      second_workspace = Path.join(test_root, "second-workspace")
+
+      Enum.each([first_workspace, second_workspace], fn workspace ->
+        File.mkdir_p!(Path.join(workspace, ".git"))
+      end)
+
+      policy = %{
+        "type" => "workspaceWrite",
+        "writableRoots" => ["{{workspace}}/.git"],
+        "networkAccess" => true,
+        "readOnlyAccess" => %{"type" => "fullAccess"}
+      }
+
+      settings = %Schema{
+        codex: %Codex{turn_sandbox_policy: policy},
+        workspace: %Schema.Workspace{root: Path.join(test_root, "ignored")}
+      }
+
+      assert {:ok, first_policy} = Schema.resolve_runtime_turn_sandbox_policy(settings, first_workspace)
+      assert {:ok, canonical_first_git} = SymphonyElixir.PathSafety.canonicalize(Path.join(first_workspace, ".git"))
+      assert first_policy["writableRoots"] == [canonical_first_git]
+      assert first_policy["networkAccess"] == true
+      assert first_policy["readOnlyAccess"] == %{"type" => "fullAccess"}
+
+      assert {:ok, second_policy} = Schema.resolve_runtime_turn_sandbox_policy(settings, second_workspace)
+      assert {:ok, canonical_second_git} = SymphonyElixir.PathSafety.canonicalize(Path.join(second_workspace, ".git"))
+      assert second_policy["writableRoots"] == [canonical_second_git]
+      refute second_policy["writableRoots"] == first_policy["writableRoots"]
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "runtime sandbox policy fails closed for unsafe workspace placeholders" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-runtime-sandbox-workspace-token-rejections-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      outside = Path.join(test_root, "outside")
+      missing_workspace = Path.join(test_root, "stale-workspace")
+      non_directory = Path.join(workspace, "not-a-directory")
+      symlink = Path.join(workspace, "git-link")
+
+      File.mkdir_p!(Path.join(workspace, ".git"))
+      File.mkdir_p!(outside)
+      File.write!(non_directory, "not a directory")
+      File.ln_s!(outside, symlink)
+
+      unsafe_roots = [
+        "{{workspace}}",
+        "{{workspace}}/../outside",
+        "{{workspace}}/missing",
+        "{{workspace}}/not-a-directory"
+      ]
+
+      Enum.each(unsafe_roots, fn root ->
+        settings = %Schema{
+          codex: %Codex{turn_sandbox_policy: %{"type" => "workspaceWrite", "writableRoots" => [root]}},
+          workspace: %Schema.Workspace{root: Path.join(test_root, "ignored")}
+        }
+
+        assert {:error, {:unsafe_turn_sandbox_policy, _}} =
+                 Schema.resolve_runtime_turn_sandbox_policy(settings, workspace)
+      end)
+
+      assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+      assert {:ok, canonical_outside} = SymphonyElixir.PathSafety.canonicalize(outside)
+
+      symlink_settings = %Schema{
+        codex: %Codex{
+          turn_sandbox_policy: %{"type" => "workspaceWrite", "writableRoots" => ["{{workspace}}/git-link"]}
+        },
+        workspace: %Schema.Workspace{root: Path.join(test_root, "ignored")}
+      }
+
+      placeholder_root = "{{workspace}}/git-link"
+
+      symlink_escape =
+        {:workspace_placeholder_symlink_escape, placeholder_root, canonical_outside, canonical_workspace}
+
+      expected_error = {:unsafe_turn_sandbox_policy, symlink_escape}
+
+      assert {:error, ^expected_error} =
+               Schema.resolve_runtime_turn_sandbox_policy(symlink_settings, workspace)
+
+      missing_workspace_settings = %Schema{
+        codex: %Codex{
+          turn_sandbox_policy: %{"type" => "workspaceWrite", "writableRoots" => ["{{workspace}}/.git"]}
+        },
+        workspace: %Schema.Workspace{root: Path.join(test_root, "ignored")}
+      }
+
+      assert {:error, {:unsafe_turn_sandbox_policy, _}} =
+               Schema.resolve_runtime_turn_sandbox_policy(missing_workspace_settings, missing_workspace)
+
+      assert {:error, {:unsafe_turn_sandbox_policy, _}} =
+               Schema.resolve_runtime_turn_sandbox_policy(missing_workspace_settings, workspace, remote: true)
+
+      unsupported_policy = %Schema{
+        codex: %Codex{
+          turn_sandbox_policy: %{"type" => "readOnly", "writableRoots" => ["{{workspace}}/.git"]}
+        },
+        workspace: %Schema.Workspace{root: Path.join(test_root, "ignored")}
+      }
+
+      assert {:error, {:unsafe_turn_sandbox_policy, _}} =
+               Schema.resolve_runtime_turn_sandbox_policy(unsupported_policy, workspace)
+
+      misplaced_placeholder_policy = %Schema{
+        codex: %Codex{
+          turn_sandbox_policy: %{
+            "type" => "workspaceWrite",
+            "writableRoots" => ["relative/path"],
+            "metadata" => "{{workspace}}/.git"
+          }
+        },
+        workspace: %Schema.Workspace{root: Path.join(test_root, "ignored")}
+      }
+
+      assert {:error, {:unsafe_turn_sandbox_policy, _}} =
+               Schema.resolve_runtime_turn_sandbox_policy(misplaced_placeholder_policy, workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "runtime sandbox policy preserves explicit policies without workspace placeholders byte for byte" do
+    policy = %{
+      "type" => "workspaceWrite",
+      "writableRoots" => ["relative/path", "$HOME"],
+      "networkAccess" => true,
+      "readOnlyAccess" => %{"type" => "fullAccess"},
+      "futureField" => %{"keep" => [1, true]}
+    }
+
+    settings = %Schema{
+      codex: %Codex{turn_sandbox_policy: policy},
+      workspace: %Schema.Workspace{root: "/tmp/ignored"}
+    }
+
+    assert {:ok, ^policy} = Schema.resolve_runtime_turn_sandbox_policy(settings, nil)
+    assert {:ok, ^policy} = Schema.resolve_runtime_turn_sandbox_policy(settings, nil, remote: true)
+  end
+
   test "path safety returns errors for invalid path segments" do
     invalid_segment = String.duplicate("a", 300)
     path = Path.join(System.tmp_dir!(), invalid_segment)
@@ -1537,6 +1694,44 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert {:error, {:path_canonicalize_failed, ^expanded_path, :enametoolong}} =
              SymphonyElixir.PathSafety.canonicalize(path)
+  end
+
+  test "path safety rejects symlink loops and excessive chains without blocking workspace placeholder resolution" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-path-safety-symlink-loop-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      loop = Path.join(workspace, ".git")
+      File.mkdir_p!(workspace)
+      File.ln_s!(".git", loop)
+
+      task = Task.async(fn -> SymphonyElixir.PathSafety.canonicalize(loop) end)
+
+      case Task.yield(task, 200) do
+        {:ok, result} ->
+          assert {:error, {:path_canonicalize_failed, ^loop, :symlink_loop}} = result
+
+        nil ->
+          Task.shutdown(task, :brutal_kill)
+          flunk("PathSafety.canonicalize/1 did not terminate for a symlink loop")
+      end
+
+      for index <- 0..40 do
+        target = if index == 40, do: "target", else: "link-#{index + 1}"
+        File.ln_s!(target, Path.join(workspace, "link-#{index}"))
+      end
+
+      deep_link = Path.join(workspace, "link-0")
+
+      assert {:error, {:path_canonicalize_failed, ^deep_link, :symlink_depth_exceeded}} =
+               SymphonyElixir.PathSafety.canonicalize(deep_link)
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "runtime sandbox policy resolution defaults when omitted and ignores workspace for explicit policies" do
