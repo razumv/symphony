@@ -1552,7 +1552,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server does not pass tracker credentials to the local Codex child" do
+  test "app server does not pass tracker or admission credentials to the local Codex child" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1561,14 +1561,17 @@ defmodule SymphonyElixir.AppServerTest do
 
     custom_secret_env = "SYMP_CUSTOM_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
     profile_marker_env = "SYMP_TEST_BASH_PROFILE_LOADED_#{System.unique_integer([:positive])}"
+    admission_token_file_env = "MY_SYMPHONY_ADMISSION_TOKEN_FILE"
     previous_secret = System.get_env("LINEAR_API_KEY")
     previous_custom_secret = System.get_env(custom_secret_env)
+    previous_admission_token_file = System.get_env(admission_token_file_env)
     previous_home = System.get_env("HOME")
     previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
 
     on_exit(fn ->
       restore_env("LINEAR_API_KEY", previous_secret)
       restore_env(custom_secret_env, previous_custom_secret)
+      restore_env(admission_token_file_env, previous_admission_token_file)
       restore_env("HOME", previous_home)
       restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
     end)
@@ -1586,11 +1589,13 @@ defmodule SymphonyElixir.AppServerTest do
       File.write!(Path.join(bash_home, ".bash_profile"), """
       export LINEAR_API_KEY='profile-canonical-secret-that-must-not-reach-child'
       export #{custom_secret_env}='profile-custom-secret-that-must-not-reach-child'
+      export #{admission_token_file_env}='profile-admission-token-file-that-must-not-reach-child'
       export #{profile_marker_env}=1
       """)
 
       System.put_env("LINEAR_API_KEY", "canonical-secret-that-must-not-reach-child")
       System.put_env(custom_secret_env, "custom-secret-that-must-not-reach-child")
+      System.put_env(admission_token_file_env, "admission-token-file-that-must-not-reach-child")
       System.put_env("HOME", bash_home)
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
 
@@ -1600,6 +1605,7 @@ defmodule SymphonyElixir.AppServerTest do
       printf 'PROFILE_LOADED:%s\n' "$#{profile_marker_env}" >> "$trace_file"
       printf 'CANONICAL_SECRET:%s\n' "$LINEAR_API_KEY" >> "$trace_file"
       printf 'CUSTOM_SECRET:%s\n' "$#{custom_secret_env}" >> "$trace_file"
+      printf 'ADMISSION_TOKEN_FILE:%s\n' "$#{admission_token_file_env}" >> "$trace_file"
       count=0
 
       while IFS= read -r line; do
@@ -1648,7 +1654,47 @@ defmodule SymphonyElixir.AppServerTest do
       assert File.read!(trace_file) =~ "PROFILE_LOADED:1\n"
       assert File.read!(trace_file) =~ "CANONICAL_SECRET:\n"
       assert File.read!(trace_file) =~ "CUSTOM_SECRET:\n"
+      assert File.read!(trace_file) =~ "ADMISSION_TOKEN_FILE:\n"
       refute File.read!(trace_file) =~ "secret-that-must-not-reach-child"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "trusted workspace hooks retain the controller credential environment" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-controller-env-#{System.unique_integer([:positive])}"
+      )
+
+    admission_token_file_env = "MY_SYMPHONY_ADMISSION_TOKEN_FILE"
+    admission_token_file = Path.join(test_root, "admission.token")
+    previous_admission_token_file = System.get_env(admission_token_file_env)
+
+    on_exit(fn ->
+      restore_env(admission_token_file_env, previous_admission_token_file)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CONTROLLER")
+      before_trace = Path.join(test_root, "before-run.trace")
+      after_trace = Path.join(test_root, "after-run.trace")
+
+      File.mkdir_p!(workspace)
+      System.put_env(admission_token_file_env, admission_token_file)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_run: "printf %s \"$#{admission_token_file_env}\" > #{before_trace}",
+        hook_after_run: "printf %s \"$#{admission_token_file_env}\" > #{after_trace}"
+      )
+
+      assert :ok = Workspace.run_before_run_hook(workspace, "MT-CONTROLLER")
+      assert :ok = Workspace.run_after_run_hook(workspace, "MT-CONTROLLER")
+      assert File.read!(before_trace) == admission_token_file
+      assert File.read!(after_trace) == admission_token_file
     after
       File.rm_rf(test_root)
     end
