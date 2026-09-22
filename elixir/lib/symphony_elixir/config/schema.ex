@@ -114,13 +114,35 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:routes, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :routes], empty_values: [])
+      |> validate_change(:routes, &validate_routes/2)
     end
+
+    defp validate_routes(:routes, routes) when is_map(routes) do
+      case Enum.find(routes, &(not valid_route?(&1))) do
+        nil -> []
+        _invalid -> [routes: "must map a workspace key to a relative path ending in that key"]
+      end
+    end
+
+    defp validate_routes(:routes, _routes),
+      do: [routes: "must be a map of workspace-key routes"]
+
+    defp valid_route?({key, route}) when is_binary(key) and is_binary(route) do
+      key not in ["", ".", ".."] and Regex.match?(~r/\A[a-zA-Z0-9._-]+\z/, key) and
+        Path.type(route) == :relative and Path.basename(route) == key and
+        route
+        |> Path.split()
+        |> Enum.all?(&(&1 not in ["", ".", ".."]))
+    end
+
+    defp valid_route?(_route), do: false
   end
 
   defmodule Worker do

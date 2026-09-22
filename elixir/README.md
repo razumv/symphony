@@ -174,6 +174,11 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- `workspace.routes` optionally maps a collision-safe workspace key (for example `GH-712`) to a
+  relative replacement directory under `workspace.root` (for example `replacements/GH-712`). A
+  routed directory must end in its key; traversal is rejected and local routing retains the existing
+  containment and symlink-escape guards. The route applies consistently to creation, cleanup, and
+  the predicted dashboard path, so an existing default issue directory remains untouched.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or

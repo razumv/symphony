@@ -57,6 +57,45 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert String.starts_with?(Path.basename(first_workspace), "MT_Det--")
   end
 
+  test "workspace route isolates a replacement clone from the default issue directory" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-route-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      default_workspace = Path.join(workspace_root, "GH-712")
+      replacement_route = Path.join(["replacements", "GH-712"])
+      replacement_workspace = Path.join(workspace_root, replacement_route)
+
+      File.mkdir_p!(default_workspace)
+      File.write!(Path.join(default_workspace, "protected-index"), "do not reuse\n")
+      {:ok, replacement_workspace} = SymphonyElixir.PathSafety.canonicalize(replacement_workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_routes: %{"GH-712" => replacement_route},
+        hook_after_create: "echo replacement > workspace-kind"
+      )
+
+      assert Workspace.workspace_directory("GH-712") == replacement_route
+      assert {:ok, ^replacement_workspace} = Workspace.create_for_issue("GH-712")
+      assert File.read!(Path.join(default_workspace, "protected-index")) == "do not reuse\n"
+      assert File.read!(Path.join(replacement_workspace, "workspace-kind")) == "replacement\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace routes reject paths outside their configured root" do
+    assert {:error, {:invalid_workflow_config, errors}} =
+             Schema.parse(%{"workspace" => %{"routes" => %{"GH-712" => "../GH-712"}}})
+
+    assert errors =~ "routes"
+  end
+
   test "relative local workspace roots resolve from the workflow directory" do
     workflow_dir = Path.dirname(Workflow.workflow_file_path())
     launcher_dir = Path.join(System.tmp_dir!(), "symphony-elixir-launcher-#{System.unique_integer([:positive])}")

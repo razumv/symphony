@@ -248,12 +248,24 @@ defmodule SymphonyElixir.Workspace do
 
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
     Config.local_workspace_root()
-    |> Path.join(safe_id)
+    |> Path.join(workspace_directory(safe_id))
     |> PathSafety.canonicalize()
   end
 
   defp workspace_path_for_issue(safe_id, worker_host) when is_binary(safe_id) and is_binary(worker_host) do
-    {:ok, Path.join(Config.settings!().workspace.root, safe_id)}
+    {:ok, Path.join(Config.settings!().workspace.root, workspace_directory(safe_id))}
+  end
+
+  @doc """
+  Returns the configured workspace directory relative to `workspace.root`.
+
+  Routes are keyed by the collision-safe workspace key and must be validated relative paths that
+  end in that key. Without a route, the workspace key itself is used.
+  """
+  @spec workspace_directory(map() | String.t() | nil) :: String.t()
+  def workspace_directory(issue_or_identifier) do
+    safe_id = workspace_key(issue_or_identifier)
+    Map.get(Config.settings!().workspace.routes, safe_id, safe_id)
   end
 
   @doc """
